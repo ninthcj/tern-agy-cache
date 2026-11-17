@@ -1,0 +1,5 @@
+__pycache__/
+*.py[cod]
+tern.d.luau
+target/
+.DS_Store

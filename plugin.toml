@@ -1,0 +1,7 @@
+schema = 1
+id = "agy-cache"
+name = "Antigravity Cache"
+version = "0.1.0"
+description = "Prompt-cache hit rate bar above every Antigravity (agy) composer, empirical 5-minute TTL countdown, widget bar meter, and per-turn details canvas."
+icon = "gauge"
+window = "window.luau"
