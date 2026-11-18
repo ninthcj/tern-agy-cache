@@ -34,7 +34,66 @@ class ProbeTests(unittest.TestCase):
         cwd, paths = probe.parse_lsof_fn_output(lsof_sample)
         self.assertEqual(cwd, "/Users/demo/Code/app")
         self.assertEqual(probe.find_conv_from_paths(paths), uid)
+        win_paths = [rf"C:\Users\demo\.gemini\antigravity-cli\conversations\{uid}.db"]
+        self.assertEqual(probe.find_conv_from_paths(win_paths), uid)
         self.assertEqual(probe.parse_ps_eww_pane("259601 s005 S+ 0:01 agy acp TERN_PANE=1378684502035 HOME=/Users/demo"), "1378684502035")
+
+    def test_windows_discovery_matches_title_uuid_and_sqlite_workspace_uri(self) -> None:
+        import sqlite3
+
+        uid_resumed = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee"
+        uid_fresh = "99999999-8888-7777-6666-555555555555"
+        uid_stale = "12121212-3434-5656-7878-909090909090"
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            conv_dir = root / "conversations"
+            conv_dir.mkdir(parents=True)
+
+            for cid, ws_uri, with_wal in (
+                (uid_resumed, "file:///C:/Users/Alice/AppOne", False),
+                (uid_stale, "file:///C:/Users/Alice/AppTwo", False),
+                (uid_fresh, "file:///C:/Users/Alice/AppTwo", True),
+            ):
+                tdir = root / "brain" / cid / ".system_generated" / "logs"
+                tdir.mkdir(parents=True)
+                (tdir / "transcript.jsonl").write_text('{"type":"USER_INPUT"}\n', encoding="utf-8")
+                db_path = conv_dir / f"{cid}.db"
+                conn = sqlite3.connect(db_path)
+                conn.execute("CREATE TABLE trajectory_metadata_blob (id TEXT PRIMARY KEY, data BLOB)")
+                conn.execute(
+                    "INSERT INTO trajectory_metadata_blob VALUES ('main', ?)",
+                    (b"\x0a(" + ws_uri.encode("utf-8") + b"z",),
+                )
+                conn.commit()
+                conn.close()
+                if with_wal:
+                    Path(f"{db_path}-wal").write_bytes(b"wal")
+
+            hints = [
+                {"pane": 10, "cwd": r"C:\Users\Alice\AppOne", "title": f"agy --conversation={uid_resumed}", "command": None},
+                {"pane": 20, "cwd": r"C:\Users\Alice\AppTwo", "title": "New Chat", "command": None},
+                # `omp.exe` worker in same workspace must NEVER steal or duplicate `agy`'s conversation
+                {"pane": 21, "cwd": r"C:\Users\Alice\AppTwo", "title": "omp worker", "command": r"C:\Local\omp.exe --auto-approve"},
+            ]
+
+            # 1. With live `agy acp` process: resolves pane 10 (title UUID) and pane 20 (active .db-wal workspace match), skips omp pane 21
+            found = probe.discover_panes_windows(
+                hints,
+                root,
+                win_procs=[{"ProcessId": 4200, "ParentProcessId": 1000, "CommandLine": "agy.cmd acp"}],
+            )
+            self.assertEqual(set(found.keys()), {"10", "20"})
+            self.assertEqual(found["10"]["conversation_id"], uid_resumed)
+            self.assertEqual(found["20"]["conversation_id"], uid_fresh)
+
+            # 2. With zero live `agy` processes: unresolved workspace pane 20 is NOT falsely matched to closed `.db` files
+            found_no_agy = probe.discover_panes_windows(
+                [{"pane": 20, "cwd": r"C:\Users\Alice\AppTwo", "title": "Claude", "command": None}],
+                root,
+                win_procs=[],
+            )
+            self.assertEqual(found_no_agy, {})
 
     def test_summarize_transcript_computes_hits_and_epoch(self) -> None:
         uid = "11111111-2222-3333-4444-555555555555"

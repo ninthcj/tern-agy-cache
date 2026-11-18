@@ -21,7 +21,7 @@
 - **基于 950+ 轮真实日志校准的 5 分钟隐式缓存倒计时**：不同于 Anthropic 的 1 小时扩展缓存，Antigravity 采用后端隐式 KV 前缀缓存，实测存活悬崖在 **5 分钟**左右（`<1m` 命中率 `98.4%`，超过 `6m` 降至 `~0%`）。自动区分 `warm`（热命中）、`primed`（冷启动或切模型刚建好新前缀）、`expiring`（剩余 `<1:00`）与 `cold`（已过期）。
 - **底栏多样式原生组件（`agy-cache/hit`）**：支持 `ring`（圆环）、`bar`（进度条）、`text`（纯文本）与 `graph`（近 24 轮命中率折线图）四种 Tern 原生底栏样式。
 - **逐轮 Token 明细面板 & 可选过期提醒**：点击组件或通过命令面板打开侧边原生 Canvas 查看最近 12 轮的 `Cached / Uncached / Out` 明细表；支持按需开启后台面板剩余 1 分钟过期 Toast 提醒。
-- **纯事件驱动、零轮询扫盘（支持 Linux 与 macOS）**：仅依赖 Python 3.10+ 标准库，在 `agent_finished`、`focus` 等原生生命周期事件时按 `TERN_PANE` 精准关联进程与会话日志。
+- **纯事件驱动、零轮询扫盘（全平台支持 Linux、macOS 与 Windows）**：仅依赖 Python 3.10+ 标准库，在 `agent_finished`、`focus` 等原生生命周期事件时精准关联面板进程与会话日志（Windows 下自动适配 `python` / `py -3` 启动器与无黑窗 CIM + SQLite 元数据反查）。
 
 ## 一键安装
 

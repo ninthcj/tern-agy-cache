@@ -1,23 +1,27 @@
 #!/usr/bin/env python3
-"""probe.py — Map live `agy acp` Tern panes to Antigravity transcripts (Linux & macOS) and compute prompt-cache metrics."""
+"""probe.py — Map live `agy acp` Tern panes to Antigravity transcripts across Linux, macOS, and Windows."""
 
 from __future__ import annotations
 
 import json
 import os
 import re
+import sqlite3
 import subprocess
 import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlparse
 
 UUID_RE = re.compile(r"([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})", re.I)
 TERN_PANE_ENV_RE = re.compile(r"(?:^|\s)TERN_PANE=(\d+)(?:\s|$)")
+FILE_URI_BYTES_RE = re.compile(rb"file:///[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+")
+WIN_DRIVE_RE = re.compile(r"^/?([A-Za-z]:)(/.*)?$")
 
 
 def antigravity_data_dir() -> Path:
-    """Resolve Antigravity CLI state directory (`~/.gemini/antigravity-cli` by default)."""
+    """Resolve Antigravity CLI state directory (`~/.gemini/antigravity-cli` across Linux, macOS & Windows)."""
     override = os.environ.get("ANTIGRAVITY_CLI_HOME")
     if override:
         return Path(override).expanduser()
@@ -28,7 +32,9 @@ def antigravity_data_dir() -> Path:
 
 
 def find_conv_from_cmdline(cmd: str) -> str | None:
-    for flag in ("--resume", "--conversation"):
+    if not cmd:
+        return None
+    for flag in ("--resume", "--conversation", "agy:"):
         idx = cmd.find(flag)
         if idx >= 0:
             m = UUID_RE.search(cmd[idx:])
@@ -39,11 +45,71 @@ def find_conv_from_cmdline(cmd: str) -> str | None:
 
 def find_conv_from_paths(paths: list[str]) -> str | None:
     for target in paths:
-        if "/conversations/" in target and target.endswith(".db"):
-            m = UUID_RE.search(Path(target).stem)
+        norm = target.replace("\\", "/")
+        if "/conversations/" in norm and norm.endswith(".db"):
+            m = UUID_RE.search(Path(norm).stem)
             if m:
                 return m.group(1).lower()
     return None
+
+
+def normalize_workspace_key(path_or_uri: str) -> str:
+    """Normalize a local path or `file://` URI into a comparable workspace key across POSIX & Windows."""
+    s = path_or_uri.strip()
+    if not s:
+        return ""
+    if s.startswith("file://"):
+        parsed = urlparse(s)
+        s = unquote(parsed.path or "")
+    s = s.replace("\\", "/")
+    m = WIN_DRIVE_RE.match(s)
+    if m:
+        drive = m.group(1).lower()
+        rest = (m.group(2) or "").rstrip("/").lower()
+        return f"{drive}{rest}"
+    return s.rstrip("/") or "/"
+
+
+def extract_workspace_keys_from_db(db_path: Path) -> set[str]:
+    """Read workspace `file://` URIs recorded in `trajectory_metadata_blob` of an Antigravity `.db`."""
+    keys: set[str] = set()
+    if not db_path.is_file():
+        return keys
+    conn: sqlite3.Connection | None = None
+    try:
+        uri = f"file:{db_path.as_posix()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True, timeout=0.5)
+        rows = conn.execute("SELECT data FROM trajectory_metadata_blob").fetchall()
+        for (blob,) in rows:
+            if not isinstance(blob, (bytes, bytearray)):
+                continue
+            for m in FILE_URI_BYTES_RE.finditer(bytes(blob)):
+                raw_uri = m.group(0).decode("utf-8", errors="ignore")
+                # Trim trailing protobuf printable tag byte if stuck to end of path (only when path doesn't exist)
+                norm = normalize_workspace_key(raw_uri)
+                if norm:
+                    keys.add(norm)
+    except Exception:
+        pass
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return keys
+
+
+def _workspace_matches(pane_key: str, db_keys: set[str]) -> bool:
+    if not pane_key or not db_keys:
+        return False
+    if pane_key in db_keys:
+        return True
+    # Protobuf string fields adjacent to a printable ASCII field tag can carry 1 trailing byte in regex scans
+    for candidate in db_keys:
+        if len(candidate) == len(pane_key) + 1 and candidate.startswith(pane_key):
+            return True
+    return False
 
 
 # ── Linux (/proc) discovery ────────────────────────────────────────────────
@@ -223,7 +289,155 @@ def discover_panes_macos() -> dict[str, dict[str, Any]]:
     return panes
 
 
-def discover_live_agy_panes() -> dict[str, dict[str, Any]]:
+# ── Windows (CIM Win32_Process + Tern WindowCx hints + SQLite WAL/URI) ─────
+
+
+def _query_windows_agy_processes() -> list[dict[str, Any]]:
+    """Query active `agy acp` processes on Windows via PowerShell CIM without flashing a console window."""
+    ps_script = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object { $_.CommandLine -and $_.CommandLine -match 'agy' } | "
+        "Select-Object ProcessId,ParentProcessId,CommandLine | ConvertTo-Json -Compress"
+    )
+    kwargs: dict[str, Any] = {}
+    if hasattr(subprocess, "CREATE_NO_WINDOW"):
+        kwargs["creationflags"] = subprocess.CREATE_NO_WINDOW
+    for shell_exe in ("powershell.exe", "pwsh.exe"):
+        try:
+            proc = subprocess.run(
+                [shell_exe, "-NoProfile", "-NonInteractive", "-Command", ps_script],
+                capture_output=True,
+                text=True,
+                timeout=2.0,
+                check=False,
+                **kwargs,
+            )
+            if proc.returncode != 0:
+                continue
+            raw = proc.stdout.strip()
+            if not raw:
+                return []
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                return [parsed]
+            if isinstance(parsed, list):
+                return [x for x in parsed if isinstance(x, dict)]
+        except FileNotFoundError:
+            continue
+        except Exception:
+            break
+    return []
+
+
+def _is_likely_other_agent_hint(hint: dict[str, Any]) -> bool:
+    cmd = str(hint.get("command") or "").lower()
+    if not cmd:
+        return False
+    if "agy" in cmd or "antigravity" in cmd:
+        return False
+    # Exclude explicit non-agy worker commands (e.g. `omp`, `claude`, `codex`)
+    for other in ("omp", "oh-my-pi", "claude", "codex", "opencode"):
+        if other in cmd:
+            return True
+    return False
+
+
+def discover_panes_windows(
+    hints: list[dict[str, Any]],
+    data_dir: Path,
+    win_procs: list[dict[str, Any]] | None = None,
+) -> dict[str, dict[str, Any]]:
+    """Map live Tern ACP `agy` panes on Windows using WindowCx hints + Win32_Process + `.db` metadata."""
+    panes: dict[str, dict[str, Any]] = {}
+    if not hints:
+        return panes
+
+    procs = _query_windows_agy_processes() if win_procs is None else win_procs
+    has_live_agy = any("agy" in str(p.get("CommandLine") or "").lower() for p in procs)
+    claimed_convs: set[str] = set()
+
+    # 1. Direct UUID match from pane title or command (`agy --conversation=<uuid>` / `tern acp` reopen)
+    unresolved_hints: list[dict[str, Any]] = []
+    for h in hints:
+        if _is_likely_other_agent_hint(h):
+            continue
+        raw_pane = h.get("pane")
+        if raw_pane is None or not str(raw_pane).isdigit():
+            continue
+        pane_str = str(int(raw_pane))
+        cwd = str(h.get("cwd") or "")
+        conv_id = find_conv_from_cmdline(str(h.get("title") or "")) or find_conv_from_cmdline(
+            str(h.get("command") or "")
+        )
+        if conv_id and (data_dir / "brain" / conv_id).is_dir():
+            claimed_convs.add(conv_id)
+            panes[pane_str] = {
+                "pane": int(pane_str),
+                "conversation_id": conv_id,
+                "cwd": cwd,
+                "pid": 0,
+            }
+        else:
+            unresolved_hints.append(h)
+
+    if not unresolved_hints or not has_live_agy:
+        return panes
+
+    # 2. Match remaining live `agy` panes against `.db` workspace URIs (preferring active `.db-wal` + newest mtime)
+    conv_dir = data_dir / "conversations"
+    if not conv_dir.is_dir():
+        return panes
+
+    db_candidates: list[tuple[int, float, str, Path]] = []
+    for db_file in conv_dir.glob("*.db"):
+        m = UUID_RE.search(db_file.stem)
+        if not m:
+            continue
+        cid = m.group(1).lower()
+        if cid in claimed_convs:
+            continue
+        tpath = data_dir / "brain" / cid / ".system_generated" / "logs" / "transcript.jsonl"
+        if not tpath.is_file():
+            continue
+        has_wal = 1 if Path(f"{db_file}-wal").exists() else 0
+        try:
+            mtime = tpath.stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        db_candidates.append((has_wal, mtime, cid, db_file))
+
+    db_candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    # Inspect at most the 24 most recent conversations so probes stay <15ms
+    db_candidates = db_candidates[:24]
+    ws_cache: dict[str, set[str]] = {}
+
+    for h in unresolved_hints:
+        pane_str = str(int(h["pane"]))
+        cwd = str(h.get("cwd") or "")
+        want_key = normalize_workspace_key(cwd)
+        if not want_key:
+            continue
+        for _has_wal, _mtime, cid, db_file in db_candidates:
+            if cid in claimed_convs:
+                continue
+            if cid not in ws_cache:
+                ws_cache[cid] = extract_workspace_keys_from_db(db_file)
+            if _workspace_matches(want_key, ws_cache[cid]):
+                claimed_convs.add(cid)
+                panes[pane_str] = {
+                    "pane": int(pane_str),
+                    "conversation_id": cid,
+                    "cwd": cwd,
+                    "pid": 0,
+                }
+                break
+
+    return panes
+
+
+def discover_live_agy_panes(hints: list[dict[str, Any]], data_dir: Path) -> dict[str, dict[str, Any]]:
+    if sys.platform == "win32":
+        return discover_panes_windows(hints, data_dir)
     if sys.platform == "darwin":
         return discover_panes_macos()
     return discover_panes_linux()
@@ -338,9 +552,25 @@ def summarize_transcript(conv_id: str, data_dir: Path | None = None) -> dict[str
     return summarize_transcript_file(tpath, conv_id)
 
 
+def _read_stdin_hints() -> list[dict[str, Any]]:
+    if sys.stdin.isatty():
+        return []
+    try:
+        raw = sys.stdin.read()
+        if not raw or not raw.strip():
+            return []
+        obj = json.loads(raw)
+        if isinstance(obj, dict) and isinstance(obj.get("hints"), list):
+            return [x for x in obj["hints"] if isinstance(x, dict)]
+    except Exception:
+        pass
+    return []
+
+
 def main() -> int:
     data_dir = antigravity_data_dir()
-    live = discover_live_agy_panes()
+    hints = _read_stdin_hints()
+    live = discover_live_agy_panes(hints, data_dir)
     out: dict[str, Any] = {}
     for pane_key, info in live.items():
         stats = summarize_transcript(info["conversation_id"], data_dir=data_dir)

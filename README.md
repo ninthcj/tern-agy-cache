@@ -28,7 +28,7 @@ When running **Antigravity CLI (`agy`)** as a native ACP agent inside [Tern](htt
 - **Empirically Calibrated 5-Minute Implicit-Cache TTL** — Unlike Anthropic's 1-hour extended cache, Antigravity relies on server-side implicit KV prefix caching whose real retention cliff sits at **~5 minutes** (measured across 950+ live turns: `98.4%` hit `<1m`, `91.3%` `1–2m`, `82.8%` `2–3m`, dropping to `~0%` past `6m`). Tracks `warm`, `primed` (fresh prefix built on cold/model switch), `expiring` (`<1:00`), and `cold`.
 - **Widget Bar Meter (`agy-cache/hit`)** — Offers `ring`, `bar`, `text`, and 24-turn sparkline `graph` styles for Tern's bottom widget bar.
 - **Native Per-Turn Details Canvas & Optional Expiry Toast** — Inspect the latest 12 turns (`Step`, `Hit`, `Cached`, `Uncached`, `Out`) in a native Tern canvas, and optionally enable a 1-minute pre-expiry toast for background panes.
-- **Event-Driven & Cross-Platform (Linux + macOS)** — Zero background `.jsonl` file polling; refreshes on Tern lifecycle events (`agent_finished`, `agent_state`, `focus`, `window_start`) by mapping live `agy acp` `TERN_PANE` processes (`Linux /proc` or `macOS ps + lsof`) to `~/.gemini/antigravity-cli/brain/<id>` transcripts using Python 3.10+ stdlib only.
+- **Event-Driven & Cross-Platform (Linux, macOS & Windows)** — Zero background `.jsonl` file polling; refreshes on Tern lifecycle events (`agent_finished`, `agent_state`, `focus`, `window_start`) by mapping live `agy acp` panes (`Linux /proc`, `macOS ps + lsof`, or `Windows CIM + SQLite metadata`) to `~/.gemini/antigravity-cli/brain/<id>` transcripts using Python 3.10+ stdlib only.
 
 ## Install
 

@@ -2,7 +2,9 @@
 -- agy-cache: Native prompt-cache bar above every Antigravity (`agy`) composer + widget bar ring & details canvas.
 
 local ui = tern.ui
-local probe_path = tern.plugin.dir .. "/probe.py"
+local is_windows = (tern.runtime.os == "windows")
+local SEP = if is_windows then "\\" else "/"
+local probe_path = tern.plugin.dir .. SEP .. "probe.py"
 local DETAILS_ACTION = "plugin.agy-cache.details"
 local TTL_MS = 5 * 60 * 1000 -- Empirical ~5-minute implicit KV/prefix cache TTL in Antigravity
 local WARN_MS = 60 * 1000
@@ -56,6 +58,44 @@ local refresh_inflight = false
 local refresh_queued = false
 local installed_line_css = ""
 local tick_armed = false
+local last_hints_json = ""
+local win_py_idx = 1
+
+local function build_probe_argv(): { string }
+	if not is_windows then
+		return { "python3", probe_path }
+	end
+	if win_py_idx == 1 then
+		return { "python", probe_path }
+	elseif win_py_idx == 2 then
+		return { "py", "-3", probe_path }
+	end
+	return { "python3", probe_path }
+end
+
+local function update_hints_from_cx(cx: WindowCx?)
+	if not cx then
+		return
+	end
+	local titles: { [number]: string } = {}
+	for _, p in ipairs(cx.session:panes()) do
+		titles[p.pane] = p.title or ""
+	end
+	local hints = {}
+	for _, a in ipairs(cx.agents:list()) do
+		table.insert(hints, {
+			pane = a.pane,
+			cwd = a.cwd,
+			title = titles[a.pane] or "",
+			command = if a.command ~= tern.json.null then a.command else nil,
+			model = if a.model ~= tern.json.null then a.model else nil,
+		})
+	end
+	local ok_e, encoded = pcall(tern.json.encode, { hints = tern.json.array(hints) })
+	if ok_e and type(encoded) == "string" then
+		last_hints_json = encoded
+	end
+end
 
 local function load_settings()
 	local ok, raw = pcall(tern.kv.get, KV_SETTINGS)
@@ -485,14 +525,23 @@ local function refresh_canvas(cx: WindowCx)
 	end
 end
 
-local function run_probe()
+local function run_probe(cx: WindowCx?)
+	if cx then
+		update_hints_from_cx(cx)
+	end
 	if refresh_inflight then
 		refresh_queued = true
 		return
 	end
 	refresh_inflight = true
-	tern.process.run({ "python3", probe_path }, { timeout_ms = 3000 }, function(res: ProcessResult, later: WindowCx?)
+	local argv = build_probe_argv()
+	tern.process.run(argv, { stdin = last_hints_json, timeout_ms = 3000 }, function(res: ProcessResult, later: WindowCx?)
 		refresh_inflight = false
+		if is_windows and (res.status == -1 or res.status == 9009) then
+			win_py_idx = (win_py_idx % 3) + 1
+			run_probe(later)
+			return
+		end
 		if res.status == 0 and res.stdout ~= "" then
 			local ok_j, decoded = pcall(tern.json.decode, res.stdout)
 			if ok_j and type(decoded) == "table" and type(decoded.panes) == "table" then
@@ -514,7 +563,7 @@ local function run_probe()
 		end
 		if refresh_queued then
 			refresh_queued = false
-			run_probe()
+			run_probe(later)
 		end
 	end)
 end
@@ -524,7 +573,7 @@ tern.command({
 	title = "Antigravity Cache: Show details",
 	icon = "gauge",
 	run = function(cx: WindowCx)
-		run_probe()
+		run_probe(cx)
 		if is_canvas_open(cx, details_canvas) then
 			cx.canvas:set(details_canvas :: number, { view = build_canvas_view(cx) })
 			cx.layout:focus(details_canvas :: number)
@@ -618,20 +667,20 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 		tern.chrome.refresh()
 	end
 	update_composer_css(cx)
-	run_probe()
+	run_probe(cx)
 end)
 
-tern.on("agent_finished", function()
-	run_probe()
+tern.on("agent_finished", function(_ev: AgentFinishedEvent, cx: WindowCx)
+	run_probe(cx)
 end)
 
-tern.on("agent_state", function()
-	run_probe()
+tern.on("agent_state", function(_ev: AgentStateEvent, cx: WindowCx)
+	run_probe(cx)
 end)
 
 tern.on("pane_created", function(_ev: PaneEvent, cx: WindowCx)
 	update_composer_css(cx)
-	run_probe()
+	run_probe(cx)
 end)
 
 tern.on("pane_closed", function(ev: PaneEvent, cx: WindowCx)
@@ -657,8 +706,10 @@ end)
 tern.on("window_start", function(cx: WindowCx)
 	load_settings()
 	update_composer_css(cx)
-	run_probe()
+	run_probe(cx)
 end)
 
 load_settings()
-tern.timer(0, run_probe)
+tern.timer(0, function(cx: WindowCx?)
+	run_probe(cx)
+end)
