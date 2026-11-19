@@ -389,6 +389,17 @@ local function update_composer_css(cx: WindowCx?)
 end
 
 local ensure_tick: () -> ()
+local run_probe: (cx: WindowCx?) -> ()
+local working_probe_ticks = 0
+
+local function has_working_agy(cx: WindowCx): boolean
+	for _, a in ipairs(cx.agents:list()) do
+		if by_pane[a.pane] ~= nil and a.state == "working" then
+			return true
+		end
+	end
+	return false
+end
 
 local function on_tick(cx: WindowCx?)
 	tick_armed = false
@@ -398,6 +409,15 @@ local function on_tick(cx: WindowCx?)
 	if cx then
 		update_composer_css(cx)
 		check_expiry_toasts(cx)
+		if has_working_agy(cx) then
+			working_probe_ticks += 1
+			if working_probe_ticks >= 5 then
+				working_probe_ticks = 0
+				run_probe(cx)
+			end
+		else
+			working_probe_ticks = 0
+		end
 	end
 	ensure_tick()
 end
@@ -525,7 +545,7 @@ local function refresh_canvas(cx: WindowCx)
 	end
 end
 
-local function run_probe(cx: WindowCx?)
+run_probe = function(cx: WindowCx?)
 	if cx then
 		update_hints_from_cx(cx)
 	end
@@ -670,8 +690,14 @@ tern.on("focus", function(ev: FocusEvent, cx: WindowCx)
 	run_probe(cx)
 end)
 
-tern.on("agent_finished", function(_ev: AgentFinishedEvent, cx: WindowCx)
+tern.on("agent_finished", function(ev: AgentFinishedEvent, cx: WindowCx)
 	run_probe(cx)
+	if by_pane[ev.pane] ~= nil then
+		-- Re-probe briefly after turn completion to catch late transcript.jsonl flushes from agy
+		tern.timer(600, function(later_cx: WindowCx?)
+			run_probe(later_cx)
+		end)
+	end
 end)
 
 tern.on("agent_state", function(_ev: AgentStateEvent, cx: WindowCx)
